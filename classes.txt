@@ -1,0 +1,1 @@
+0 - style, 1 - sport, 2 - media, 3 - economics, 4 - culture, 5 - forces, 6 - life, 7 - science, 8 - travel, 9 - business

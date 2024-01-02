@@ -1,0 +1,283 @@
+from gensim.parsing.preprocessing import remove_stopwords
+import nltk
+import pymorphy2
+from nltk.corpus import stopwords
+from dataclasses import dataclass
+from typing import Iterator
+import gzip
+from tqdm import tqdm
+import os
+import time
+import json
+import gensim.downloader as api
+from multiprocessing import cpu_count
+from gensim.models.word2vec import Word2Vec
+from gensim.models.doc2vec import TaggedDocument
+from gensim.models import doc2vec
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import OneHotEncoder
+import joblib
+import numpy as np
+import random
+
+morph = pymorphy2.MorphAnalyzer()
+nltk.download('stopwords')
+
+def Read_File(Full_Path_W_Name, Res_As_List):
+    Res = ""
+    with open(Full_Path_W_Name, 'r') as File:
+        Res = File.read()
+        File.close()
+    if Res_As_List:
+        return Res.split("\n")
+    else:
+        return Res
+
+
+def Clean_Text(Text, As_List = False, Res_Type = 0):
+    #Text - string or list of strings, depends on As_List value,
+    # As_List - bool,
+    # Res_Type - int, 0 - String (Text), 1 - list of strings (Text as Lines), 2 - list of lists of strings (Text as Words)
+    Txt_List = []
+    Res = []
+    if As_List:
+        for Buf_Txt in Text:
+            Buf = ""
+            if Buf_Txt[len(Buf_Txt) - 1] == '.':
+                Buf = Buf_Txt[:-1]
+                Buf = Buf + ". "
+            else:
+                Buf = Buf_Txt
+            Txt_List.append(Buf)
+    else:
+        Txt_Buf = Text.replace(".\n", ". \n")
+        if Txt_Buf[len(Txt_Buf) - 1] == '.':
+            Txt_Buf = Txt_Buf[:-1]
+            Txt_Buf = Txt_Buf + ". "
+        Txt_List = Txt_Buf.split("\n")
+    Txt_List_Buf = ' '.join(Txt_List)
+    Txt_List = Txt_List_Buf.split('. ')
+    for Txt_Part in Txt_List:
+        Txt_Part_Buf = Txt_Part.replace(",", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace("(", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace(")", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace(":", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace("\"", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace("'", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace(" -", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace(" —", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace("«", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace("»", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace("\\", "")
+        Txt_Part_Buf = Txt_Part_Buf.replace("/", "")
+        if Txt_Part_Buf == "":
+            continue
+        Txt_Buf = remove_stopwords(Txt_Part_Buf, stopwords.words()).split()
+        Sub_Res = []
+        for Word in Txt_Buf:
+            W_mod = morph.parse(Word)[0]
+            Sub_Res.append(W_mod.normal_form)
+        if not(Res_Type == 2):
+            Res.append(' '.join(Sub_Res))
+        else:
+            Res = Res + Sub_Res
+    if not(Res_Type == 0):
+        return Res
+    else:
+        return '\n'.join(Res)
+
+
+def Create_Data_Set_W2V(Texts_Arr):
+    Res = []
+    print("Creating Word To Vec Dataset:")
+    for Text in tqdm(Texts_Arr):
+        Res.append(Clean_Text(Text.text, Res_Type=2))
+    return Res
+
+
+@dataclass
+class Text:
+    label: str
+    title: str
+    text: str
+
+
+def Read_Texts(fn: str) -> Iterator[Text]:
+    with gzip.open(fn, "rt", encoding="utf-8") as File:
+        for Line in File:
+            yield Text(*Line.strip().split("\t"))
+
+
+def Save_Ds_To_File(Data_Set, File_Name, File_Path, Set_Classes = None):
+    with open(File_Path + File_Name, "w+") as File:
+        if Set_Classes == None:
+            File.write(json.dumps({'DataSet': Data_Set}))
+        else:
+            File.write(json.dumps({'DataSet': Data_Set, "Answers": Set_Classes}))
+        File.close()
+
+
+def Read_Ds(Full_Path, W_Ans = False):
+    Buf = None
+    with open(Full_Path, "r") as File:
+        Buf = json.load(File)
+    if W_Ans:
+        return Buf['DataSet'], Buf['Answers']
+    return Buf['DataSet']
+
+
+def Texts_To_Vec(Texts_Arr, Model, Neural_Outp = False, Doc_2_Vec = False):
+    Res = []
+    Sub_Res_Classes = []
+    Unique_Classes = []
+    print("Converting Text to Vectors")
+    for Text in tqdm(Texts_Arr):
+        Sub_Res = []
+        Cl_Text = Clean_Text(Text.text, Res_Type=2)
+        if Text.label in Unique_Classes:
+            Sub_Res_Classes.append(Unique_Classes.index(Text.label))
+        else:
+            Sub_Res_Classes.append(len(Unique_Classes))
+            Unique_Classes.append(Text.label)
+        if Doc_2_Vec:
+           Sub_Res = Model.infer_vector(Cl_Text).tolist()
+        else:
+            First = True
+            for Word in Cl_Text:
+                try:
+                    if First:
+                        Sub_Res = Model.wv[Word]
+                        First = False
+                    else:
+                        Sub_Res = map(sum, zip(Sub_Res, Model.wv[Word]))
+                except ValueError:
+                    print("Text Contains Unknown Word: " + Word)
+            Sub_Res = [x / len(Cl_Text) for x in Sub_Res]
+        Res.append(Sub_Res)
+    Res_Classes = []
+    if Neural_Outp:
+        for Val in Sub_Res_Classes:
+            Val_Res = [0] * len(Unique_Classes)
+            Val_Res[Val] = 1
+            Res_Classes.append(Val_Res)
+    else:
+        Res_Classes = Sub_Res_Classes
+    return Res, Res_Classes
+
+
+def tagged_document(list_of_ListOfWords):
+    for x, ListOfWords in enumerate(list_of_ListOfWords):
+        yield doc2vec.TaggedDocument(ListOfWords, [x])
+
+
+Ds = []
+File_Path = ""
+Pick = -1
+while True:
+    print("[0] - Create DataSet And Train W2V")
+    print("[1] - Upload DataSet And Train W2V")
+    print("[2] - Upload W2V Model And Create DataSet For Random Forest")
+    print("[3] - Upload DataSet And Train Random Forest")
+    print("[4] - Upload DataSet And Train D2V")
+    print("[5] - Upload D2V Model And Create DataSet For Random Forest ")
+    Pick_Buf = input("What You Wanna Do?: ")
+    try:
+        Pick = int(Pick_Buf)
+        break
+    except ValueError:
+        print("Only Int Input Allowed At This Stage, Try Again...")
+        pass
+while True:
+    File_Path = input("Enter Full Path To File + File Name with Extension: ")
+    if os.path.exists(File_Path):
+        break
+    else:
+        print("File Doesn't Exist, Try Again")
+Save_Path = File_Path[:(File_Path.rfind('/') + 1)]
+match Pick:
+    case 0:
+        Ds_Save_Name = "Data_Set_" + str(time.time()).replace(".", "") + ".json"
+        Texts = list(Read_Texts(File_Path))
+        Ds = Create_Data_Set_W2V(Texts)
+        Save_Ds_To_File(Ds, Ds_Save_Name, Save_Path)
+        print("DataSet Saved at: " + Save_Path + Ds_Save_Name)
+        New_Model = Word2Vec(Ds, min_count=0, workers=cpu_count())
+        W2V_Name = "W2V_Model_" + str(time.time()).replace(".", "")
+        New_Model.save(Save_Path + W2V_Name)
+        print("Word To Vec Model Saved at: " + Save_Path + W2V_Name)
+    case 1:
+        Ds = Read_Ds(File_Path)
+        print(Ds[0])
+        print("DataSet Uploaded!")
+        New_Model = Word2Vec(Ds, min_count=0, workers=cpu_count())
+        W2V_Name = "W2V_Model_" + str(time.time()).replace(".", "")
+        New_Model.save(Save_Path + W2V_Name)
+        print("Word To Vec Model Saved at: " + Save_Path + W2V_Name)
+    case 2:
+        Texts = list(Read_Texts(File_Path))
+        while True:
+            File_Path = input("Enter Full Path To W2V File + File Name with Extension: ")
+            if os.path.exists(File_Path):
+                break
+            else:
+                print("File Doesn't Exist, Try Again")
+        Model = Word2Vec.load(File_Path)
+        Texts_Vecs, Text_Classes = Texts_To_Vec(Texts, Model)
+        Ds_Save_Name = "Data_Set_Docs_" + str(time.time()).replace(".", "") + ".json"
+        Save_Ds_To_File(Texts_Vecs, Ds_Save_Name, Save_Path, Text_Classes)
+        print("DataSet Saved at: " + Save_Path + Ds_Save_Name)
+    case 3:
+        Ds, Answers = Read_Ds(File_Path, True)
+        Tr_Test_Sep = round(len(Ds) * 0.9)
+        Ds_Train = Ds[:Tr_Test_Sep]
+        Ans_Train = Answers[:Tr_Test_Sep]
+        Ds_Test = Ds[Tr_Test_Sep:]
+        Ans_Test = Answers[Tr_Test_Sep:]
+        New_Model = RandomForestClassifier(random_state=0)
+        Train_Full = list(zip(Ds_Train, Ans_Train))
+        random.shuffle(Train_Full)
+        Ds_Train, Ans_Train = zip(*Train_Full)
+        New_Model.fit(Ds_Train, Ans_Train)
+        Precision = New_Model.score(Ds_Test, Ans_Test)
+        print("Created Forest Precision: " + str(Precision))
+        Model_Save_Name = "Random_Forest(Alt)_" + str(Precision) + ".pkl"
+        _ = joblib.dump(New_Model, Save_Path + Model_Save_Name, compress=9)
+        print("Random Forest Model Saved at: " + Save_Path + Model_Save_Name)
+    case 4:
+        Ds = Read_Ds(File_Path)
+        print(Ds[0])
+        print("DataSet Uploaded!")
+        Tag_Doc_Ds = list(tagged_document(Ds))
+        New_Model = doc2vec.Doc2Vec(vector_size=40, min_count=2, epochs=30)
+        New_Model.build_vocab(Tag_Doc_Ds)
+        New_Model.train(Tag_Doc_Ds, total_examples=New_Model.corpus_count, epochs=New_Model.epochs)
+        D2V_Name = "D2V_Model_" + str(time.time()).replace(".", "")
+        New_Model.save(Save_Path + D2V_Name)
+        print("Doc To Vec Model Saved at: " + Save_Path + D2V_Name)
+    case 5:
+        Texts = list(Read_Texts(File_Path))
+        while True:
+            File_Path = input("Enter Full Path To D2V File + File Name with Extension: ")
+            if os.path.exists(File_Path):
+                break
+            else:
+                print("File Doesn't Exist, Try Again")
+        Model = doc2vec.Doc2Vec.load(File_Path)
+        Texts_Vecs, Text_Classes = Texts_To_Vec(Texts, Model, Doc_2_Vec=True)
+        print(Texts_Vecs[0])
+        Ds_Save_Name = "Data_Set_Docs(Alt)_" + str(time.time()).replace(".", "") + ".json"
+        Save_Ds_To_File(Texts_Vecs, Ds_Save_Name, Save_Path, Text_Classes)
+        print("DataSet Saved at: " + Save_Path + Ds_Save_Name)
+
+#New_Model = Word2Vec(Ds, min_count=0, workers=cpu_count())
+#New_Model.save(Save_Path + "W2V_Model_" + str(time.time()).replace(".", ""))
+
+
+#text = "Парусная гонка Giraglia Rolex Cup пройдет в Средиземном море в 64-й раз. Победители соревнования, проводимого с 1953 года Yacht Club Italiano, помимо других призов традиционно получают в подарок часы от швейцарского бренда Rolex. Об этом сообщается в пресс-релизе, поступившем в редакцию «Ленты.ру» в среду, 8 мая. Rolex Yacht-Master 40 Фото: пресс-служба Mercury Соревнования будут проходить с 10 по 18 июня. Первый этап: ночной переход из Сан-Ремо в Сен-Тропе 10-11 июня (дистанция 50 морских миль — около 90 километров). Второй этап: серия прибрежных гонок в бухте Сен-Тропе с 11 по 14 июня. Финальный этап пройдет с 15 по 18 июня: оффшорная гонка по маршруту Сен-Тропе — Генуя (243 морских мили — 450 километров). Маршрут проходит через скалистый остров Джиралья к северу от Корсики и завершается в Генуе.Регата, с 1997 года проходящая при поддержке Rolex, считается одной из самых значительных яхтенных гонок в Средиземноморье. В этом году в ней ожидается участие трех российских экипажей."
+#text = Clean_Text(text)
+#arr_text = Clean_Text(text,Res_Type=1)
+#arr_too_text = Clean_Text(text, Res_Type=2)
+#print(text)
+#print(arr_text)
+#print(arr_too_text)
+
